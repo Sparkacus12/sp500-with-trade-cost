@@ -8,37 +8,112 @@ from scipy.stats import shapiro, linregress
 
 st.set_page_config(page_title="S&P 500 Long + Tactical Hedge Lab", layout="wide")
 
-LOOKBACK = 30
-P_THRESHOLD = 0.10
-PRICE_PERIOD = "5y"
-MAX_LONGS = 3
+st.title("S&P 500 Long + Tactical SPY Hedge Lab")
 
-REBALANCE_WEEKDAY = 0
-MIN_HOLD_DAYS = 20
-TREND_EXIT_THRESHOLD = -0.02
-IMPLIED_SCORE_EXIT_THRESHOLD = -10
+# ============================================================
+# USER CONTROLS
+# ============================================================
 
-STOCK_COST_PER_SIDE = 0.0010
-HEDGE_COST_PER_SIDE = 0.0002
+st.sidebar.header("Strategy settings")
 
+PRICE_PERIOD = st.sidebar.selectbox(
+    "Backtest period",
+    ["3y", "5y", "7y", "10y"],
+    index=1,
+)
+
+LOOKBACK = st.sidebar.slider("Normality/trend lookback days", 20, 60, 30, 5)
+P_THRESHOLD = st.sidebar.slider("Normality p-value threshold", 0.01, 0.30, 0.10, 0.01)
+
+MAX_LONGS = st.sidebar.slider(
+    "Maximum number of long positions",
+    min_value=1,
+    max_value=10,
+    value=3,
+    step=1,
+)
+
+MIN_HOLD_DAYS = st.sidebar.slider(
+    "Minimum holding period, days",
+    min_value=0,
+    max_value=30,
+    value=3,
+    step=1,
+)
+
+rebalance_choice = st.sidebar.selectbox(
+    "Rebalance frequency",
+    ["Daily", "Monday only"],
+    index=0,
+)
+
+REBALANCE_WEEKDAY = None if rebalance_choice == "Daily" else 0
+
+TREND_EXIT_THRESHOLD = st.sidebar.number_input(
+    "Trend exit threshold",
+    value=-0.01,
+    step=0.01,
+    format="%.3f",
+)
+
+IMPLIED_SCORE_EXIT_THRESHOLD = st.sidebar.number_input(
+    "Implied revision exit threshold",
+    value=-5.0,
+    step=1.0,
+    format="%.1f",
+)
+
+st.sidebar.header("Trading costs")
+
+STOCK_COST_BPS = st.sidebar.slider(
+    "Stock cost per side, bps",
+    min_value=0,
+    max_value=100,
+    value=10,
+    step=1,
+)
+
+HEDGE_COST_BPS = st.sidebar.slider(
+    "SPY hedge cost per side, bps",
+    min_value=0,
+    max_value=50,
+    value=2,
+    step=1,
+)
+
+STOCK_COST_PER_SIDE = STOCK_COST_BPS / 10000
+HEDGE_COST_PER_SIDE = HEDGE_COST_BPS / 10000
+
+st.sidebar.header("Hedge settings")
+
+HEDGE_SIZE = st.sidebar.slider(
+    "SPY hedge size",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.50,
+    step=0.05,
+)
+
+NFCI_LOOSE_Z = st.sidebar.slider("Loose conditions z trigger", 0.0, 3.0, 0.75, 0.05)
+SKEW_LOW_Z = st.sidebar.slider("Low SKEW z trigger", -3.0, 0.0, -0.75, 0.05)
+MOMENTUM_EUPHORIA_Z = st.sidebar.slider("SPY momentum z trigger", 0.0, 3.0, 1.00, 0.05)
+VIX_LOW_Z = st.sidebar.slider("Low VIX z trigger", -3.0, 0.0, -0.50, 0.05)
+
+# DRAM / memory-cycle proxy
 MEMORY_WEIGHT_TECH = 20
 MEMORY_WEIGHT_COMMUNICATIONS = 8
 MEMORY_WEIGHT_INDUSTRIALS = 5
 
-HEDGE_SIZE = 0.50
-NFCI_LOOSE_Z = 1.50
-SKEW_HIGH_Z = 1.50
-MOMENTUM_EUPHORIA_Z = 1.50
-VIX_LOW_Z = -1.00
-
-st.title("S&P 500 Long + Tactical SPY Hedge Lab")
-
 st.caption(
     "Systematic research tool only, not investment advice. "
-    "Long book uses regime normalisation and implied earnings-revision pressure. "
-    "Trading-cost-aware version uses weekly rebalancing, minimum holding periods, softer exit thresholds, "
-    "and a tactical SPY hedge when financial conditions are loose and sentiment/complacency is elevated."
+    "Long book uses return-distribution normalisation, trend persistence, relative strength, "
+    "macro/earnings-revision pressure and a DRAM/memory-cycle proxy. "
+    "The hedge shorts SPY when financial conditions are loose and equity complacency is high."
 )
+
+# ============================================================
+# DATA LOADERS
+# ============================================================
 
 @st.cache_data(ttl=60 * 60 * 12)
 def get_sp500():
@@ -49,11 +124,19 @@ def get_sp500():
     table["Ticker"] = table["Symbol"].str.replace(".", "-", regex=False)
     return table[["Ticker", "Security", "GICS Sector"]]
 
+
 @st.cache_data(ttl=60 * 60 * 6)
-def get_prices(tickers):
-    data = yf.download(tickers, period=PRICE_PERIOD, auto_adjust=True, progress=False, threads=True)
+def get_prices(tickers, period):
+    data = yf.download(
+        tickers,
+        period=period,
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
     close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]]
     return close.dropna(axis=1, how="all").ffill()
+
 
 MARKET_TICKERS = {
     "Market": "SPY",
@@ -76,11 +159,12 @@ MARKET_TICKERS = {
     "Utilities": "XLU",
 }
 
+
 @st.cache_data(ttl=60 * 60 * 6)
-def get_market_proxy_prices():
+def get_market_proxy_prices(period):
     data = yf.download(
         list(MARKET_TICKERS.values()),
-        period=PRICE_PERIOD,
+        period=period,
         auto_adjust=True,
         progress=False,
         threads=True,
@@ -88,26 +172,39 @@ def get_market_proxy_prices():
     close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]]
     return close.dropna(axis=1, how="all").ffill()
 
+
 @st.cache_data(ttl=60 * 60 * 6)
-def get_market_sentiment_data():
+def get_market_sentiment_data(period):
     tickers = {"SPY": "SPY", "VIX": "^VIX", "SKEW": "^SKEW"}
     out = {}
 
     for name, ticker in tickers.items():
         try:
-            data = yf.download(ticker, period=PRICE_PERIOD, auto_adjust=True, progress=False, threads=False)
+            data = yf.download(
+                ticker,
+                period=period,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+
             if data is None or data.empty:
                 continue
+
             close = data["Close"]
             if isinstance(close, pd.DataFrame):
                 close = close.iloc[:, 0]
+
             close = close.dropna()
+
             if len(close) > 50:
                 out[name] = close
+
         except Exception:
             pass
 
     return out
+
 
 FRED_SERIES = {
     "industrial_production": "INDPRO",
@@ -125,10 +222,11 @@ FRED_SERIES = {
     "oil": "DCOILWTICO",
 }
 
+
 @st.cache_data(ttl=60 * 60 * 12)
-def get_fred_data():
+def get_fred_data(period):
     end = pd.Timestamp.today()
-    years = int(PRICE_PERIOD.replace("y", "")) if PRICE_PERIOD.endswith("y") else 5
+    years = int(period.replace("y", "")) if period.endswith("y") else 5
     start = end - pd.DateOffset(years=years)
     series = {}
 
@@ -149,56 +247,78 @@ def get_fred_data():
 
     return pd.DataFrame(series).sort_index().ffill()
 
+
+# ============================================================
+# HELPERS
+# ============================================================
+
 def trend_score(series):
     series = series.dropna()
     if len(series) < 3:
         return np.nan
+
     y = np.log(series.values)
     x = np.arange(len(y))
     return linregress(x, y).slope * 100
 
-def normality_pvalue(series):
+
+def normality_pvalue(series, lookback):
     returns = series.pct_change().dropna()
-    if len(returns) < LOOKBACK - 1:
+    if len(returns) < lookback - 1:
         return np.nan
+
     try:
         return shapiro(returns).pvalue
     except Exception:
         return np.nan
 
+
 def pct_return(price_df, ticker, days=30):
     try:
         if ticker is None or ticker not in price_df.columns:
             return 0.0
+
         s = price_df[ticker].dropna()
+
         if len(s) < days + 1:
             return 0.0
+
         return s.iloc[-1] / s.iloc[-days] - 1
+
     except Exception:
         return 0.0
+
 
 def realised_vol(series):
     r = series.pct_change().dropna()
     return r.std() if len(r) >= 3 else 0.0
 
-def vol_compression_for_ticker(ticker, prices):
+
+def vol_compression_for_ticker(ticker, prices, lookback):
     try:
         s = prices[ticker].dropna()
-        if len(s) < LOOKBACK:
+        if len(s) < lookback:
             return 0.0
+
         return realised_vol(s.iloc[-30:-15]) - realised_vol(s.iloc[-15:])
+
     except Exception:
         return 0.0
+
 
 def latest_zscore(series, window=252):
     s = series.dropna()
     if len(s) < max(30, window // 2):
         return np.nan
+
     w = s.iloc[-window:] if len(s) >= window else s
     std = w.std()
+
     if std == 0 or np.isnan(std):
         return np.nan
+
     return float((w.iloc[-1] - w.mean()) / std)
+
 
 def zscore_latest(series, lookback=36, transform="diff"):
     s = series.dropna()
@@ -215,21 +335,29 @@ def zscore_latest(series, lookback=36, transform="diff"):
         x = s.copy()
 
     x = x.replace([np.inf, -np.inf], np.nan).dropna()
+
     if len(x) < 12:
         return 0.0
 
     window = x.iloc[-lookback:] if len(x) >= lookback else x
     std = window.std()
+
     if std == 0 or np.isnan(std):
         return 0.0
 
     return float((window.iloc[-1] - window.mean()) / std)
+
 
 def same_or_before(series, date):
     try:
         return series[series.index <= date]
     except Exception:
         return pd.Series(dtype=float)
+
+
+# ============================================================
+# MACRO MODEL
+# ============================================================
 
 def build_fred_macro_factor_scores(fred):
     if fred.empty:
@@ -261,7 +389,11 @@ def build_fred_macro_factor_scores(fred):
         -zscore_latest(fred.get("financial_conditions", pd.Series(dtype=float)), transform="level"),
     ])
 
-    loose_conditions = -zscore_latest(fred.get("financial_conditions", pd.Series(dtype=float)), transform="level")
+    loose_conditions = -zscore_latest(
+        fred.get("financial_conditions", pd.Series(dtype=float)),
+        transform="level",
+    )
+
     liquidity = zscore_latest(fred.get("m2", pd.Series(dtype=float)), transform="yoy")
     dollar_relief = -zscore_latest(fred.get("dollar", pd.Series(dtype=float)), transform="diff")
     oil = zscore_latest(fred.get("oil", pd.Series(dtype=float)), transform="diff")
@@ -283,25 +415,102 @@ def build_fred_macro_factor_scores(fred):
         "Loose conditions": float(np.nan_to_num(loose_conditions)),
     }
 
+
 SECTOR_FRED_WEIGHTS = {
-    "Information Technology": {"Growth": 0.25, "Inflation relief": 0.20, "Financial conditions": 0.20, "Liquidity": 0.25, "Dollar relief": 0.10},
-    "Communication Services": {"Growth": 0.30, "Inflation relief": 0.15, "Financial conditions": 0.15, "Liquidity": 0.20, "Dollar relief": 0.20},
-    "Consumer Discretionary": {"Growth": 0.35, "Inflation relief": 0.20, "Financial conditions": 0.20, "Liquidity": 0.15, "Dollar relief": 0.10},
-    "Consumer Staples": {"Growth": 0.10, "Inflation relief": 0.35, "Financial conditions": 0.15, "Liquidity": 0.10, "Dollar relief": 0.30},
-    "Industrials": {"Growth": 0.45, "Inflation relief": 0.10, "Financial conditions": 0.20, "Liquidity": 0.10, "Dollar relief": 0.15},
-    "Materials": {"Growth": 0.45, "Inflation relief": 0.05, "Financial conditions": 0.15, "Liquidity": 0.10, "Dollar relief": 0.15, "Oil": 0.10},
-    "Energy": {"Growth": 0.15, "Inflation relief": -0.10, "Financial conditions": 0.10, "Liquidity": 0.05, "Dollar relief": 0.10, "Oil": 0.70},
-    "Financials": {"Growth": 0.25, "Inflation relief": 0.05, "Financial conditions": 0.25, "Liquidity": 0.05, "Yield curve": 0.40},
-    "Health Care": {"Growth": 0.10, "Inflation relief": 0.25, "Financial conditions": 0.15, "Liquidity": 0.15, "Dollar relief": 0.35},
-    "Real Estate": {"Growth": 0.10, "Inflation relief": 0.30, "Financial conditions": 0.25, "Liquidity": 0.25, "Yield curve": -0.10},
-    "Utilities": {"Growth": -0.05, "Inflation relief": 0.35, "Financial conditions": 0.25, "Liquidity": 0.25, "Yield curve": -0.10},
+    "Information Technology": {
+        "Growth": 0.25,
+        "Inflation relief": 0.20,
+        "Financial conditions": 0.20,
+        "Liquidity": 0.25,
+        "Dollar relief": 0.10,
+    },
+    "Communication Services": {
+        "Growth": 0.30,
+        "Inflation relief": 0.15,
+        "Financial conditions": 0.15,
+        "Liquidity": 0.20,
+        "Dollar relief": 0.20,
+    },
+    "Consumer Discretionary": {
+        "Growth": 0.35,
+        "Inflation relief": 0.20,
+        "Financial conditions": 0.20,
+        "Liquidity": 0.15,
+        "Dollar relief": 0.10,
+    },
+    "Consumer Staples": {
+        "Growth": 0.10,
+        "Inflation relief": 0.35,
+        "Financial conditions": 0.15,
+        "Liquidity": 0.10,
+        "Dollar relief": 0.30,
+    },
+    "Industrials": {
+        "Growth": 0.45,
+        "Inflation relief": 0.10,
+        "Financial conditions": 0.20,
+        "Liquidity": 0.10,
+        "Dollar relief": 0.15,
+    },
+    "Materials": {
+        "Growth": 0.45,
+        "Inflation relief": 0.05,
+        "Financial conditions": 0.15,
+        "Liquidity": 0.10,
+        "Dollar relief": 0.15,
+        "Oil": 0.10,
+    },
+    "Energy": {
+        "Growth": 0.15,
+        "Inflation relief": -0.10,
+        "Financial conditions": 0.10,
+        "Liquidity": 0.05,
+        "Dollar relief": 0.10,
+        "Oil": 0.70,
+    },
+    "Financials": {
+        "Growth": 0.25,
+        "Inflation relief": 0.05,
+        "Financial conditions": 0.25,
+        "Liquidity": 0.05,
+        "Yield curve": 0.40,
+    },
+    "Health Care": {
+        "Growth": 0.10,
+        "Inflation relief": 0.25,
+        "Financial conditions": 0.15,
+        "Liquidity": 0.15,
+        "Dollar relief": 0.35,
+    },
+    "Real Estate": {
+        "Growth": 0.10,
+        "Inflation relief": 0.30,
+        "Financial conditions": 0.25,
+        "Liquidity": 0.25,
+        "Yield curve": -0.10,
+    },
+    "Utilities": {
+        "Growth": -0.05,
+        "Inflation relief": 0.35,
+        "Financial conditions": 0.25,
+        "Liquidity": 0.25,
+        "Yield curve": -0.10,
+    },
 }
+
 
 def fred_sector_macro_score(sector, fred_factor_scores):
     weights = SECTOR_FRED_WEIGHTS.get(
         sector,
-        {"Growth": 0.30, "Inflation relief": 0.20, "Financial conditions": 0.20, "Liquidity": 0.15, "Dollar relief": 0.15},
+        {
+            "Growth": 0.30,
+            "Inflation relief": 0.20,
+            "Financial conditions": 0.20,
+            "Liquidity": 0.15,
+            "Dollar relief": 0.15,
+        },
     )
+
     return sum(weights.get(k, 0.0) * fred_factor_scores.get(k, 0.0) for k in weights)
 
 def memory_cycle_momentum(market_prices):
@@ -317,6 +526,7 @@ def memory_cycle_momentum(market_prices):
 
     return 0.65 * mu_mom + 0.35 * soxx_mom
 
+
 def memory_factor_contribution(sector, market_prices):
     mem = memory_cycle_momentum(market_prices)
 
@@ -328,6 +538,7 @@ def memory_factor_contribution(sector, market_prices):
         return MEMORY_WEIGHT_INDUSTRIALS * mem
 
     return 0.0
+
 
 def market_macro_score(sector, ticker, prices, market_prices):
     sector_etf = MARKET_TICKERS.get(sector)
@@ -354,11 +565,13 @@ def market_macro_score(sector, ticker, prices, market_prices):
 
     return score + relative_strength
 
+
 def combined_macro_earnings_score(sector, ticker, prices, market_prices, fred_factor_scores):
     fred_score = fred_sector_macro_score(sector, fred_factor_scores)
     mkt_score = market_macro_score(sector, ticker, prices, market_prices)
     total = 2.0 * fred_score + 0.35 * mkt_score
     return total, fred_score, mkt_score
+
 
 def implied_earnings_revision_score(row):
     return (
@@ -368,7 +581,8 @@ def implied_earnings_revision_score(row):
         + 15 * row["Vol compression"]
         + 10 * row["Combined macro earnings score"]
     )
-    
+
+
 def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
     loose_z = fred_factor_scores.get("Loose conditions", 0.0)
 
@@ -386,12 +600,19 @@ def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
         spy_3m = sentiment["SPY"].pct_change(63).dropna()
         spy_mom_z = latest_zscore(spy_3m, 252)
 
-    skew_flag = bool(pd.notna(skew_z) and skew_z > SKEW_HIGH_Z)
+    low_skew_flag = bool(pd.notna(skew_z) and skew_z < SKEW_LOW_Z)
     euphoric_momentum_flag = bool(pd.notna(spy_mom_z) and spy_mom_z > MOMENTUM_EUPHORIA_Z)
     complacent_vix_flag = bool(pd.notna(vix_z) and vix_z < VIX_LOW_Z)
     loose_flag = bool(loose_z > NFCI_LOOSE_Z)
 
-    hedge_on = bool(loose_flag and (skew_flag or euphoric_momentum_flag or complacent_vix_flag))
+    hedge_on = bool(
+        loose_flag
+        and (
+            low_skew_flag
+            or euphoric_momentum_flag
+            or complacent_vix_flag
+        )
+    )
 
     return {
         "hedge_on": hedge_on,
@@ -401,10 +622,11 @@ def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
         "spy_3m_momentum_z": spy_mom_z,
         "vix_z": vix_z,
         "loose_flag": loose_flag,
-        "skew_flag": skew_flag,
+        "low_skew_flag": low_skew_flag,
         "euphoric_momentum_flag": euphoric_momentum_flag,
         "complacent_vix_flag": complacent_vix_flag,
     }
+
 
 def hedge_signal_at(market_prices_slice, fred_factor_scores, full_sentiment, date):
     sentiment_slice = {}
@@ -416,8 +638,10 @@ def hedge_signal_at(market_prices_slice, fred_factor_scores, full_sentiment, dat
 
     return hedge_signal_from_data(market_prices_slice, fred_factor_scores, sentiment_slice)
 
+
 def performance_stats(bt):
     bt = bt.dropna().copy()
+
     if bt.empty:
         return bt, np.nan, np.nan, np.nan, np.nan, np.nan
 
@@ -429,11 +653,17 @@ def performance_stats(bt):
     total_return = bt["Equity curve"].iloc[-1] - 1
     annualised_return = bt["Equity curve"].iloc[-1] ** (252 / len(bt)) - 1
     annualised_vol = bt["Return"].std() * np.sqrt(252)
-    sharpe = bt["Return"].mean() / bt["Return"].std() * np.sqrt(252) if bt["Return"].std() != 0 else np.nan
+    sharpe = (
+        bt["Return"].mean() / bt["Return"].std() * np.sqrt(252)
+        if bt["Return"].std() != 0
+        else np.nan
+    )
+
     drawdown = bt["Equity curve"] / bt["Equity curve"].cummax() - 1
     max_drawdown = drawdown.min()
 
     return bt, total_return, annualised_return, annualised_vol, sharpe, max_drawdown
+
 
 def show_backtest(name, bt):
     st.markdown(f"### {name}")
@@ -465,18 +695,19 @@ def show_backtest(name, bt):
 
     return bt
 
+
 with st.spinner("Loading S&P 500, prices, market proxies, sentiment and FRED macro data..."):
     sp500 = get_sp500()
     tickers = sp500["Ticker"].tolist()
-    prices = get_prices(tickers)
-    market_prices = get_market_proxy_prices()
-    sentiment = get_market_sentiment_data()
-    fred = get_fred_data()
+    prices = get_prices(tickers, PRICE_PERIOD)
+    market_prices = get_market_proxy_prices(PRICE_PERIOD)
+    sentiment = get_market_sentiment_data(PRICE_PERIOD)
+    fred = get_fred_data(PRICE_PERIOD)
 
 fred_factor_scores = build_fred_macro_factor_scores(fred)
 available = [t for t in tickers if t in prices.columns]
 
-st.subheader("FRED macro regime dashboard")
+st.subheader("Macro and hedge dashboard")
 
 fred_table = pd.DataFrame(
     [{"Factor": k, "Latest z-score": v} for k, v in fred_factor_scores.items()]
@@ -507,14 +738,15 @@ rows = []
 
 for ticker in available:
     s = prices[ticker].dropna()
+
     if len(s) < LOOKBACK + 1:
         continue
 
     window = s.iloc[-LOOKBACK:]
-    pval = normality_pvalue(window)
+    pval = normality_pvalue(window, LOOKBACK)
     trend = trend_score(window)
     ret_30d = window.iloc[-1] / window.iloc[0] - 1
-    vol_compression = vol_compression_for_ticker(ticker, prices)
+    vol_compression = vol_compression_for_ticker(ticker, prices, LOOKBACK)
 
     if np.isnan(pval) or np.isnan(trend):
         continue
@@ -532,7 +764,11 @@ df = pd.DataFrame(rows).merge(sp500, on="Ticker", how="left")
 
 macro_parts = df.apply(
     lambda r: combined_macro_earnings_score(
-        r["GICS Sector"], r["Ticker"], prices, market_prices, fred_factor_scores
+        r["GICS Sector"],
+        r["Ticker"],
+        prices,
+        market_prices,
+        fred_factor_scores,
     ),
     axis=1,
 )
@@ -540,7 +776,9 @@ macro_parts = df.apply(
 df["Combined macro earnings score"] = [x[0] for x in macro_parts]
 df["FRED sector macro score"] = [x[1] for x in macro_parts]
 df["Market-implied macro score"] = [x[2] for x in macro_parts]
-df["Memory factor contribution"] = df["GICS Sector"].apply(lambda sector: memory_factor_contribution(sector, market_prices))
+df["Memory factor contribution"] = df["GICS Sector"].apply(
+    lambda sector: memory_factor_contribution(sector, market_prices)
+)
 
 market_30d_return = pct_return(market_prices, "SPY")
 
@@ -564,10 +802,19 @@ long_screen = passed[
 st.subheader("Long book: current candidates")
 
 display_cols = [
-    "Ticker", "Security", "GICS Sector", "Trend score", "30d return",
-    "Normality p-value", "FRED sector macro score", "Market-implied macro score",
-    "Combined macro earnings score", "Memory factor contribution",
-    "Relative strength vs sector", "Vol compression", "Implied earnings revision score",
+    "Ticker",
+    "Security",
+    "GICS Sector",
+    "Trend score",
+    "30d return",
+    "Normality p-value",
+    "FRED sector macro score",
+    "Market-implied macro score",
+    "Combined macro earnings score",
+    "Memory factor contribution",
+    "Relative strength vs sector",
+    "Vol compression",
+    "Implied earnings revision score",
 ]
 
 st.dataframe(long_screen[display_cols], use_container_width=True)
@@ -575,11 +822,18 @@ st.dataframe(long_screen[display_cols], use_container_width=True)
 st.subheader("Implied earnings revision overlay")
 
 revision_table = df[[
-    "Ticker", "Security", "GICS Sector", "30d return",
-    "Relative strength vs market", "Relative strength vs sector",
-    "Trend score", "Vol compression",
-    "FRED sector macro score", "Market-implied macro score",
-    "Combined macro earnings score", "Memory factor contribution",
+    "Ticker",
+    "Security",
+    "GICS Sector",
+    "30d return",
+    "Relative strength vs market",
+    "Relative strength vs sector",
+    "Trend score",
+    "Vol compression",
+    "FRED sector macro score",
+    "Market-implied macro score",
+    "Combined macro earnings score",
+    "Memory factor contribution",
     "Implied earnings revision score",
 ]].sort_values("Implied earnings revision score", ascending=False)
 
@@ -587,24 +841,37 @@ c1, c2 = st.columns(2)
 with c1:
     st.markdown("### Highest implied upward revision pressure")
     st.dataframe(revision_table.head(15), use_container_width=True)
+
 with c2:
     st.markdown("### Lowest implied revision pressure")
-    st.dataframe(revision_table.tail(15).sort_values("Implied earnings revision score"), use_container_width=True)
+    st.dataframe(
+        revision_table.tail(15).sort_values("Implied earnings revision score"),
+        use_container_width=True,
+    )
 
 st.subheader("Backtest")
-st.write(
-    "Backtest uses weekly rebalancing, minimum holding periods, realistic trading costs, "
-    "and a tactical SPY hedge."
-)
 
 if not st.button("Run long book + tactical SPY hedge backtest"):
     st.info("Click to run the backtest. First run may take a few minutes.")
     st.stop()
 
+
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=True)
 def run_long_with_tactical_hedge_backtest(
-    prices, sector_table, market_prices, sentiment, fred_factor_scores,
-    lookback=30, p_threshold=0.10
+    prices,
+    sector_table,
+    market_prices,
+    sentiment,
+    fred_factor_scores,
+    lookback,
+    p_threshold,
+    max_longs,
+    min_hold_days,
+    rebalance_weekday,
+    trend_exit_threshold,
+    implied_score_exit_threshold,
+    stock_cost_per_side,
+    hedge_cost_per_side,
 ):
     returns = prices.pct_change()
     spy_returns = market_prices["SPY"].pct_change()
@@ -626,13 +893,19 @@ def run_long_with_tactical_hedge_backtest(
         for t in list(holding_days.keys()):
             holding_days[t] += 1
 
-        is_rebalance_day = signal_date.weekday() == REBALANCE_WEEKDAY
+        is_rebalance_day = (
+            True
+            if rebalance_weekday is None
+            else signal_date.weekday() == rebalance_weekday
+        )
+
         entries_today = 0
         exits_today = 0
 
         if is_rebalance_day:
             for ticker in list(positions.keys()):
                 current = prices[ticker].iloc[i - lookback:i].dropna()
+
                 if len(current) < lookback:
                     trade_log.append({
                         "Date": signal_date,
@@ -646,13 +919,17 @@ def run_long_with_tactical_hedge_backtest(
                     exits_today += 1
                     continue
 
-                pval = normality_pvalue(current)
+                pval = normality_pvalue(current, lookback)
                 trend = trend_score(current)
                 ret_30d = current.iloc[-1] / current.iloc[0] - 1
 
                 sector = sector_lookup.get(ticker, None)
                 macro_total, fred_score, market_score = combined_macro_earnings_score(
-                    sector, ticker, prices.iloc[:i], market_prices.iloc[:i], fred_factor_scores
+                    sector,
+                    ticker,
+                    prices.iloc[:i],
+                    market_prices.iloc[:i],
+                    fred_factor_scores,
                 )
 
                 sector_etf = MARKET_TICKERS.get(sector)
@@ -675,12 +952,12 @@ def run_long_with_tactical_hedge_backtest(
 
                 if pval <= p_threshold:
                     exit_reason = "Normality broken"
-                elif trend <= TREND_EXIT_THRESHOLD:
+                elif trend <= trend_exit_threshold:
                     exit_reason = "Positive trend broken"
-                elif implied_score <= IMPLIED_SCORE_EXIT_THRESHOLD:
+                elif implied_score <= implied_score_exit_threshold:
                     exit_reason = "Implied revision score materially negative"
 
-                if exit_reason and holding_days.get(ticker, 0) >= MIN_HOLD_DAYS:
+                if exit_reason and holding_days.get(ticker, 0) >= min_hold_days:
                     trade_log.append({
                         "Date": signal_date,
                         "Ticker": ticker,
@@ -699,7 +976,7 @@ def run_long_with_tactical_hedge_backtest(
                     exits_today += 1
 
             new_longs = []
-            open_slots = max(MAX_LONGS - len(positions), 0)
+            open_slots = max(max_longs - len(positions), 0)
 
             if open_slots > 0:
                 for ticker in prices.columns:
@@ -712,13 +989,17 @@ def run_long_with_tactical_hedge_backtest(
                     if len(prior) < lookback or len(current) < lookback:
                         continue
 
-                    prior_p = normality_pvalue(prior)
-                    current_p = normality_pvalue(current)
+                    prior_p = normality_pvalue(prior, lookback)
+                    current_p = normality_pvalue(current, lookback)
 
                     if np.isnan(prior_p) or np.isnan(current_p):
                         continue
 
-                    if not (prior_p <= p_threshold and current_p > p_threshold and current_p > prior_p):
+                    if not (
+                        prior_p <= p_threshold
+                        and current_p > p_threshold
+                        and current_p > prior_p
+                    ):
                         continue
 
                     trend = trend_score(current)
@@ -726,7 +1007,11 @@ def run_long_with_tactical_hedge_backtest(
 
                     sector = sector_lookup.get(ticker, None)
                     macro_total, fred_score, market_score = combined_macro_earnings_score(
-                        sector, ticker, prices.iloc[:i], market_prices.iloc[:i], fred_factor_scores
+                        sector,
+                        ticker,
+                        prices.iloc[:i],
+                        market_prices.iloc[:i],
+                        fred_factor_scores,
                     )
 
                     sector_etf = MARKET_TICKERS.get(sector)
@@ -797,11 +1082,11 @@ def run_long_with_tactical_hedge_backtest(
 
         portfolio_return = long_return + hedge_return
 
-        stock_weight = 1 / max(MAX_LONGS, 1)
-        stock_trading_cost = (entries_today + exits_today) * stock_weight * STOCK_COST_PER_SIDE
+        stock_weight = 1 / max(max_longs, 1)
+        stock_trading_cost = (entries_today + exits_today) * stock_weight * stock_cost_per_side
 
         hedge_turnover = abs(hedge_size - previous_hedge_size)
-        hedge_trading_cost = hedge_turnover * HEDGE_COST_PER_SIDE
+        hedge_trading_cost = hedge_turnover * hedge_cost_per_side
         previous_hedge_size = hedge_size
 
         turnover_cost = stock_trading_cost + hedge_trading_cost
@@ -831,8 +1116,22 @@ def run_long_with_tactical_hedge_backtest(
 
     return pd.DataFrame(results), pd.DataFrame(trade_log)
 
+
 bt, trades = run_long_with_tactical_hedge_backtest(
-    prices, sp500, market_prices, sentiment, fred_factor_scores, LOOKBACK, P_THRESHOLD
+    prices,
+    sp500,
+    market_prices,
+    sentiment,
+    fred_factor_scores,
+    LOOKBACK,
+    P_THRESHOLD,
+    MAX_LONGS,
+    MIN_HOLD_DAYS,
+    REBALANCE_WEEKDAY,
+    TREND_EXIT_THRESHOLD,
+    IMPLIED_SCORE_EXIT_THRESHOLD,
+    STOCK_COST_PER_SIDE,
+    HEDGE_COST_PER_SIDE,
 )
 
 bt = show_backtest("Long normalisation strategy + tactical SPY hedge", bt)
@@ -892,6 +1191,7 @@ else:
                     "Security": row.get("Security", ""),
                     "Reason": row.get("Reason", "New long signal"),
                 })
+
             elif row["Action"] == "EXIT":
                 action_rows.append({
                     "Action": "SELL",
@@ -910,8 +1210,9 @@ else:
                 "Action": "ADD HEDGE",
                 "Ticker": "SPY",
                 "Security": "SPDR S&P 500 ETF Trust",
-                "Reason": "Loose financial conditions plus euphoric/complacent sentiment",
+                "Reason": "Loose financial conditions plus complacent/euphoric equity conditions",
             })
+
         elif previous_hedge and not current_hedge:
             action_rows.append({
                 "Action": "REMOVE HEDGE",
