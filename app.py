@@ -262,7 +262,7 @@ FRED_SERIES = {
     "ten_year": "DGS10",
     "two_year": "DGS2",
     "hy_spread": "BAMLH0A0HYM2",
-    "financial_conditions": "NFCI",
+    "financial_conditions": "ANFCI",
     "m2": "M2SL",
     "dollar": "DTWEXBGS",
     "oil": "DCOILWTICO",
