@@ -369,7 +369,7 @@ def implied_earnings_revision_score(row):
         + 10 * row["Combined macro earnings score"]
     )
     
-    def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
+def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
     loose_z = fred_factor_scores.get("Loose conditions", 0.0)
 
     skew_z = np.nan
