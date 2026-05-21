@@ -1,0 +1,8 @@
+streamlit
+yfinance
+pandas
+numpy
+scipy
+lxml
+html5lib
+requests
