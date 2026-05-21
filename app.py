@@ -15,6 +15,7 @@ st.title("S&P 500 Long + Tactical SPY Hedge Lab")
 # ============================================================
 
 st.sidebar.header("Strategy settings")
+st.sidebar.info("On mobile, tap the » icon at top-left to open these controls.")
 
 PRICE_PERIOD = st.sidebar.selectbox(
     "Backtest period",
@@ -23,7 +24,14 @@ PRICE_PERIOD = st.sidebar.selectbox(
 )
 
 LOOKBACK = st.sidebar.slider("Normality/trend lookback days", 20, 60, 30, 5)
-P_THRESHOLD = st.sidebar.slider("Normality p-value threshold", 0.01, 0.30, 0.10, 0.01)
+
+P_THRESHOLD = st.sidebar.slider(
+    "Normality p-value threshold",
+    min_value=0.01,
+    max_value=0.30,
+    value=0.10,
+    step=0.01,
+)
 
 MAX_LONGS = st.sidebar.slider(
     "Maximum number of long positions",
@@ -94,12 +102,49 @@ HEDGE_SIZE = st.sidebar.slider(
     step=0.05,
 )
 
-NFCI_LOOSE_Z = st.sidebar.slider("Loose conditions z trigger", 0.0, 3.0, 0.75, 0.05)
-SKEW_LOW_Z = st.sidebar.slider("Low SKEW z trigger", -3.0, 0.0, -0.75, 0.05)
-MOMENTUM_EUPHORIA_Z = st.sidebar.slider("SPY momentum z trigger", 0.0, 3.0, 1.00, 0.05)
-VIX_LOW_Z = st.sidebar.slider("Low VIX z trigger", -3.0, 0.0, -0.50, 0.05)
+NFCI_LOOSE_Z = st.sidebar.slider(
+    "Loose conditions z trigger",
+    min_value=0.0,
+    max_value=3.0,
+    value=0.75,
+    step=0.05,
+)
 
-# DRAM / memory-cycle proxy
+SKEW_LOW_Z = st.sidebar.slider(
+    "Low SKEW z trigger",
+    min_value=-3.0,
+    max_value=0.0,
+    value=-0.75,
+    step=0.05,
+)
+
+MOMENTUM_EUPHORIA_Z = st.sidebar.slider(
+    "SPY momentum z trigger",
+    min_value=0.0,
+    max_value=3.0,
+    value=1.00,
+    step=0.05,
+)
+
+VIX_LOW_Z = st.sidebar.slider(
+    "Low VIX z trigger",
+    min_value=-3.0,
+    max_value=0.0,
+    value=-0.50,
+    step=0.05,
+)
+
+REQUIRE_MARKET_CRACK = st.sidebar.checkbox(
+    "Require SPY crack before hedge activates",
+    value=True,
+)
+
+st.sidebar.caption(
+    "Hedge logic: loose financial conditions + complacency/euphoria + optional SPY crack. "
+    "The crack filter tries to avoid shorting too early in melt-up markets."
+)
+
+# DRAM / memory-cycle proxy weights
 MEMORY_WEIGHT_TECH = 20
 MEMORY_WEIGHT_COMMUNICATIONS = 8
 MEMORY_WEIGHT_INDUSTRIALS = 5
@@ -108,7 +153,8 @@ st.caption(
     "Systematic research tool only, not investment advice. "
     "Long book uses return-distribution normalisation, trend persistence, relative strength, "
     "macro/earnings-revision pressure and a DRAM/memory-cycle proxy. "
-    "The hedge shorts SPY when financial conditions are loose and equity complacency is high."
+    "The hedge shorts SPY when financial conditions are loose and equity complacency is high, "
+    "but now optionally requires evidence that SPY is starting to crack."
 )
 
 # ============================================================
@@ -512,7 +558,7 @@ def fred_sector_macro_score(sector, fred_factor_scores):
     )
 
     return sum(weights.get(k, 0.0) * fred_factor_scores.get(k, 0.0) for k in weights)
-
+    
 def memory_cycle_momentum(market_prices):
     mu_mom = pct_return(market_prices, "MU")
     soxx_mom = pct_return(market_prices, "SOXX")
@@ -583,12 +629,23 @@ def implied_earnings_revision_score(row):
     )
 
 
-def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
+def hedge_signal_from_data(
+    market_prices,
+    fred_factor_scores,
+    sentiment=None,
+    hedge_size=0.50,
+    nfci_loose_z=0.75,
+    skew_low_z=-0.75,
+    momentum_euphoria_z=1.00,
+    vix_low_z=-0.50,
+    require_market_crack=True,
+):
     loose_z = fred_factor_scores.get("Loose conditions", 0.0)
 
     skew_z = np.nan
     vix_z = np.nan
     spy_mom_z = np.nan
+    spy_crack_flag = False
 
     if sentiment is not None and "SKEW" in sentiment:
         skew_z = latest_zscore(sentiment["SKEW"], 252)
@@ -597,26 +654,37 @@ def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
         vix_z = latest_zscore(sentiment["VIX"], 252)
 
     if sentiment is not None and "SPY" in sentiment:
-        spy_3m = sentiment["SPY"].pct_change(63).dropna()
-        spy_mom_z = latest_zscore(spy_3m, 252)
+        spy = sentiment["SPY"].dropna()
 
-    low_skew_flag = bool(pd.notna(skew_z) and skew_z < SKEW_LOW_Z)
-    euphoric_momentum_flag = bool(pd.notna(spy_mom_z) and spy_mom_z > MOMENTUM_EUPHORIA_Z)
-    complacent_vix_flag = bool(pd.notna(vix_z) and vix_z < VIX_LOW_Z)
-    loose_flag = bool(loose_z > NFCI_LOOSE_Z)
+        if len(spy) > 63:
+            spy_3m = spy.pct_change(63).dropna()
+            spy_mom_z = latest_zscore(spy_3m, 252)
 
-    hedge_on = bool(
-        loose_flag
-        and (
-            low_skew_flag
-            or euphoric_momentum_flag
-            or complacent_vix_flag
-        )
+        if len(spy) > 60:
+            spy_50dma = spy.rolling(50).mean().iloc[-1]
+            spy_below_50dma = spy.iloc[-1] < spy_50dma
+            spy_20d_return = spy.iloc[-1] / spy.iloc[-20] - 1
+            spy_crack_flag = bool(spy_below_50dma or spy_20d_return < 0)
+
+    low_skew_flag = bool(pd.notna(skew_z) and skew_z < skew_low_z)
+    euphoric_momentum_flag = bool(pd.notna(spy_mom_z) and spy_mom_z > momentum_euphoria_z)
+    complacent_vix_flag = bool(pd.notna(vix_z) and vix_z < vix_low_z)
+    loose_flag = bool(loose_z > nfci_loose_z)
+
+    complacency_flag = bool(
+        low_skew_flag
+        or euphoric_momentum_flag
+        or complacent_vix_flag
     )
+
+    if require_market_crack:
+        hedge_on = bool(loose_flag and complacency_flag and spy_crack_flag)
+    else:
+        hedge_on = bool(loose_flag and complacency_flag)
 
     return {
         "hedge_on": hedge_on,
-        "hedge_size": HEDGE_SIZE if hedge_on else 0.0,
+        "hedge_size": hedge_size if hedge_on else 0.0,
         "loose_conditions_z": loose_z,
         "skew_z": skew_z,
         "spy_3m_momentum_z": spy_mom_z,
@@ -625,10 +693,22 @@ def hedge_signal_from_data(market_prices, fred_factor_scores, sentiment=None):
         "low_skew_flag": low_skew_flag,
         "euphoric_momentum_flag": euphoric_momentum_flag,
         "complacent_vix_flag": complacent_vix_flag,
+        "spy_crack_flag": spy_crack_flag,
     }
 
 
-def hedge_signal_at(market_prices_slice, fred_factor_scores, full_sentiment, date):
+def hedge_signal_at(
+    market_prices_slice,
+    fred_factor_scores,
+    full_sentiment,
+    date,
+    hedge_size,
+    nfci_loose_z,
+    skew_low_z,
+    momentum_euphoria_z,
+    vix_low_z,
+    require_market_crack,
+):
     sentiment_slice = {}
 
     for key, series in full_sentiment.items():
@@ -636,7 +716,17 @@ def hedge_signal_at(market_prices_slice, fred_factor_scores, full_sentiment, dat
         if len(s) > 0:
             sentiment_slice[key] = s
 
-    return hedge_signal_from_data(market_prices_slice, fred_factor_scores, sentiment_slice)
+    return hedge_signal_from_data(
+        market_prices_slice,
+        fred_factor_scores,
+        sentiment_slice,
+        hedge_size,
+        nfci_loose_z,
+        skew_low_z,
+        momentum_euphoria_z,
+        vix_low_z,
+        require_market_crack,
+    )
 
 
 def performance_stats(bt):
@@ -715,7 +805,17 @@ fred_table = pd.DataFrame(
 
 st.dataframe(fred_table, use_container_width=True)
 
-current_hedge = hedge_signal_from_data(market_prices, fred_factor_scores, sentiment)
+current_hedge = hedge_signal_from_data(
+    market_prices,
+    fred_factor_scores,
+    sentiment,
+    HEDGE_SIZE,
+    NFCI_LOOSE_Z,
+    SKEW_LOW_Z,
+    MOMENTUM_EUPHORIA_Z,
+    VIX_LOW_Z,
+    REQUIRE_MARKET_CRACK,
+)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Current hedge active", "Yes" if current_hedge["hedge_on"] else "No")
@@ -726,7 +826,12 @@ c4.metric("SKEW z-score", "n/a" if pd.isna(current_hedge["skew_z"]) else f"{curr
 c1, c2, c3 = st.columns(3)
 c1.metric("SPY 3m momentum z", "n/a" if pd.isna(current_hedge["spy_3m_momentum_z"]) else f"{current_hedge['spy_3m_momentum_z']:.2f}")
 c2.metric("VIX z-score", "n/a" if pd.isna(current_hedge["vix_z"]) else f"{current_hedge['vix_z']:.2f}")
-c3.metric("Sentiment series loaded", ", ".join(sentiment.keys()) if sentiment else "None")
+c3.metric("SPY crack flag", "Yes" if current_hedge["spy_crack_flag"] else "No")
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Low SKEW flag", "Yes" if current_hedge["low_skew_flag"] else "No")
+c2.metric("Low VIX flag", "Yes" if current_hedge["complacent_vix_flag"] else "No")
+c3.metric("Momentum euphoria flag", "Yes" if current_hedge["euphoric_momentum_flag"] else "No")
 
 mem_mom_now = memory_cycle_momentum(market_prices)
 c1, c2, c3 = st.columns(3)
@@ -856,7 +961,6 @@ if not st.button("Run long book + tactical SPY hedge backtest"):
     st.stop()
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=True)
 def run_long_with_tactical_hedge_backtest(
     prices,
     sector_table,
@@ -872,6 +976,12 @@ def run_long_with_tactical_hedge_backtest(
     implied_score_exit_threshold,
     stock_cost_per_side,
     hedge_cost_per_side,
+    hedge_size,
+    nfci_loose_z,
+    skew_low_z,
+    momentum_euphoria_z,
+    vix_low_z,
+    require_market_crack,
 ):
     returns = prices.pct_change()
     spy_returns = market_prices["SPY"].pct_change()
@@ -1074,20 +1184,32 @@ def run_long_with_tactical_hedge_backtest(
         long_return = next_returns[long_tickers].mean() if long_tickers else 0.0
 
         market_slice = market_prices.iloc[:i]
-        hedge = hedge_signal_at(market_slice, fred_factor_scores, sentiment, signal_date)
-        hedge_size = hedge["hedge_size"]
+        hedge = hedge_signal_at(
+            market_slice,
+            fred_factor_scores,
+            sentiment,
+            signal_date,
+            hedge_size,
+            nfci_loose_z,
+            skew_low_z,
+            momentum_euphoria_z,
+            vix_low_z,
+            require_market_crack,
+        )
+
+        current_hedge_size = hedge["hedge_size"]
 
         spy_ret = spy_returns.loc[trade_date] if trade_date in spy_returns.index else 0.0
-        hedge_return = -hedge_size * spy_ret
+        hedge_return = -current_hedge_size * spy_ret
 
         portfolio_return = long_return + hedge_return
 
         stock_weight = 1 / max(max_longs, 1)
         stock_trading_cost = (entries_today + exits_today) * stock_weight * stock_cost_per_side
 
-        hedge_turnover = abs(hedge_size - previous_hedge_size)
+        hedge_turnover = abs(current_hedge_size - previous_hedge_size)
         hedge_trading_cost = hedge_turnover * hedge_cost_per_side
-        previous_hedge_size = hedge_size
+        previous_hedge_size = current_hedge_size
 
         turnover_cost = stock_trading_cost + hedge_trading_cost
         portfolio_return -= turnover_cost
@@ -1102,11 +1224,15 @@ def run_long_with_tactical_hedge_backtest(
             "Hedge return": hedge_return,
             "SPY return": spy_ret,
             "Hedge active": hedge["hedge_on"],
-            "Hedge size": hedge_size,
+            "Hedge size": current_hedge_size,
             "Loose conditions z": hedge["loose_conditions_z"],
             "SKEW z": hedge["skew_z"],
             "SPY 3m momentum z": hedge["spy_3m_momentum_z"],
             "VIX z": hedge["vix_z"],
+            "SPY crack flag": hedge["spy_crack_flag"],
+            "Low SKEW flag": hedge["low_skew_flag"],
+            "Low VIX flag": hedge["complacent_vix_flag"],
+            "Momentum euphoria flag": hedge["euphoric_momentum_flag"],
             "Rebalance day": is_rebalance_day,
             "Entries": entries_today,
             "Exits": exits_today,
@@ -1132,6 +1258,12 @@ bt, trades = run_long_with_tactical_hedge_backtest(
     IMPLIED_SCORE_EXIT_THRESHOLD,
     STOCK_COST_PER_SIDE,
     HEDGE_COST_PER_SIDE,
+    HEDGE_SIZE,
+    NFCI_LOOSE_Z,
+    SKEW_LOW_Z,
+    MOMENTUM_EUPHORIA_Z,
+    VIX_LOW_Z,
+    REQUIRE_MARKET_CRACK,
 )
 
 bt = show_backtest("Long normalisation strategy + tactical SPY hedge", bt)
@@ -1144,12 +1276,12 @@ else:
     latest_row = bt.iloc[-1]
     current_longs = latest_row["Longs"]
     hedge_active = latest_row["Hedge active"]
-    hedge_size = latest_row["Hedge size"]
+    hedge_size_now = latest_row["Hedge size"]
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Current long positions", int(latest_row["Number longs"]))
     c2.metric("SPY hedge active", "Yes" if hedge_active else "No")
-    c3.metric("SPY hedge size", f"{hedge_size:.0%}")
+    c3.metric("SPY hedge size", f"{hedge_size_now:.0%}")
 
     st.markdown("#### Current holdings")
 
@@ -1167,7 +1299,7 @@ else:
         holdings_rows.append({
             "Position": "SHORT",
             "Holding": "SPY",
-            "Size": f"{hedge_size:.0%} hedge",
+            "Size": f"{hedge_size_now:.0%} hedge",
         })
 
     if holdings_rows:
@@ -1190,6 +1322,7 @@ else:
                     "Ticker": row["Ticker"],
                     "Security": row.get("Security", ""),
                     "Reason": row.get("Reason", "New long signal"),
+                    "Status": "Added to portfolio",
                 })
 
             elif row["Action"] == "EXIT":
@@ -1198,6 +1331,7 @@ else:
                     "Ticker": row["Ticker"],
                     "Security": row.get("Security", ""),
                     "Reason": row.get("Reason", "Exit signal"),
+                    "Status": "Removed from portfolio",
                 })
 
     if len(bt) >= 2:
@@ -1210,7 +1344,8 @@ else:
                 "Action": "ADD HEDGE",
                 "Ticker": "SPY",
                 "Security": "SPDR S&P 500 ETF Trust",
-                "Reason": "Loose financial conditions plus complacent/euphoric equity conditions",
+                "Reason": "Loose conditions + complacency/euphoria + SPY crack filter",
+                "Status": "Added to portfolio",
             })
 
         elif previous_hedge and not current_hedge:
@@ -1219,6 +1354,7 @@ else:
                 "Ticker": "SPY",
                 "Security": "SPDR S&P 500 ETF Trust",
                 "Reason": "Hedge trigger no longer active",
+                "Status": "Removed from portfolio",
             })
 
     if action_rows:
@@ -1244,6 +1380,10 @@ if bt is not None and not bt.empty:
         "SKEW z",
         "SPY 3m momentum z",
         "VIX z",
+        "SPY crack flag",
+        "Low SKEW flag",
+        "Low VIX flag",
+        "Momentum euphoria flag",
         "Rebalance day",
         "Entries",
         "Exits",
